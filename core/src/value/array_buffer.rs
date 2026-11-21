@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::{
     ffi::c_void,
     fmt,
-    mem::{self, size_of, ManuallyDrop, MaybeUninit},
+    mem::{self, size_of, MaybeUninit},
     ops::Deref,
     ptr::NonNull,
     result::Result as StdResult,
@@ -87,73 +87,11 @@ unsafe impl<'js> JsLifetime<'js> for ArrayBuffer<'js> {
 }
 
 impl<'js> ArrayBuffer<'js> {
-    /// Create array buffer from vector data
+    /// Create array buffer from vector data, copied into the runtime's own memory (as [`new_copy`](Self::new_copy)), so
+    /// what it holds counts toward the runtime's memory usage and limit: a buffer of Rust's memory, freed by a function
+    /// of its own, is in neither, so a script could pile them up past any limit (a Blob a megabyte each).
     pub fn new<T: Copy>(ctx: Ctx<'js>, src: impl Into<Vec<T>>) -> Result<Self> {
-        let mut src = ManuallyDrop::new(src.into());
-        let ptr = src.as_mut_ptr();
-        let capacity = src.capacity();
-        let size = src.len() * size_of::<T>();
-
-        // `opaque` stays fixed across `transfer()`, so mutable capacity lives behind it instead of in it.
-        let capacity_cell = Box::into_raw(Box::new(capacity));
-
-        extern "C" fn realloc_raw<T: Copy>(
-            _rt: *mut qjs::JSRuntime,
-            opaque: *mut c_void,
-            ptr: *mut c_void,
-            size: qjs::size_t,
-        ) -> *mut c_void {
-            let capacity_cell = opaque as *mut usize;
-            let capacity = unsafe { *capacity_cell };
-            // `ManuallyDrop` so a failed or unsupported resize leaves the allocation untouched.
-            let mut vec = ManuallyDrop::new(unsafe {
-                Vec::from_raw_parts(ptr as *mut T, capacity, capacity)
-            });
-
-            if size == FREE {
-                unsafe {
-                    ManuallyDrop::drop(&mut vec);
-                    drop(Box::from_raw(capacity_cell));
-                }
-                return core::ptr::null_mut();
-            }
-
-            let elem_size = size_of::<T>();
-            if elem_size == 0 {
-                return core::ptr::null_mut();
-            }
-            let new_len = (size as usize).div_ceil(elem_size);
-
-            if new_len > capacity {
-                if vec.try_reserve_exact(new_len - capacity).is_err() {
-                    return core::ptr::null_mut();
-                }
-            } else if new_len < capacity {
-                vec.truncate(new_len);
-                vec.shrink_to(new_len);
-            }
-
-            unsafe { *capacity_cell = vec.capacity() };
-            vec.as_mut_ptr() as *mut c_void
-        }
-
-        Ok(Self(Object(unsafe {
-            let val = qjs::JS_NewArrayBuffer(
-                ctx.as_ptr(),
-                ptr as _,
-                size as _,
-                FIXED_SIZE,
-                Some(realloc_raw::<T>),
-                capacity_cell as _,
-                false,
-            );
-            ctx.handle_exception(val).inspect_err(|_| {
-                // don't forget to free data when error occurred
-                Vec::from_raw_parts(ptr, capacity, capacity);
-                drop(Box::from_raw(capacity_cell));
-            })?;
-            Value::from_js_value(ctx, val)
-        })))
+        Self::new_copy(ctx, src.into())
     }
 
     /// Create array buffer from slice
